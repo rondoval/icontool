@@ -728,6 +728,216 @@ def parse_argb_chunk(data: bytes) -> Optional[Dict]:
 
     return {"width": width, "height": height, "rgba": bytes(rgba)}
 
+
+# --- GlowIcons writing (OS3.5 ColorIcon encoder) ---
+# Inverse of the parsing above: quantise an RGBA image to a palette-mapped IMAG
+# and wrap it in a FORM ICON, the format AmigaOS 3.2+ icon.library renders. The
+# RLE packers are exact inverses of unpack_rle_8bit / unpack_rle_bitpacked, so a
+# built icon round-trips through this file's own parser (and thus icon.library).
+
+class _BitWriter:
+    """Accumulate values MSB-first into a byte stream (matches read_bits())."""
+    def __init__(self):
+        self.acc = 0
+        self.n = 0
+        self.out = bytearray()
+
+    def write(self, value: int, nbits: int) -> None:
+        for k in range(nbits - 1, -1, -1):
+            self.acc = (self.acc << 1) | ((value >> k) & 1)
+            self.n += 1
+            if self.n == 8:
+                self.out.append(self.acc)
+                self.acc = 0
+                self.n = 0
+
+    def getvalue(self) -> bytes:
+        if self.n:
+            self.out.append(self.acc << (8 - self.n))
+            self.acc = 0
+            self.n = 0
+        return bytes(self.out)
+
+
+def pack_rle_8bit(data: bytes) -> bytes:
+    """PackBits-style RLE; inverse of unpack_rle_8bit (colormap + depth-8 image)."""
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        run = 1
+        while i + run < n and data[i + run] == data[i] and run < 128:
+            run += 1
+        if run >= 2:
+            out.append((257 - run) & 0xFF)   # n>=128 -> repeat (257-n) times
+            out.append(data[i])
+            i += run
+        else:
+            start, cnt = i, 0
+            while i < n and cnt < 128:
+                if i + 1 < n and data[i] == data[i + 1]:
+                    break
+                i += 1
+                cnt += 1
+            out.append(cnt - 1)              # n<128 -> copy n+1 literals
+            out += bytes(data[start:start + cnt])
+    return bytes(out)
+
+
+def pack_rle_bitpacked(indices, depth: int) -> bytes:
+    """Inverse of unpack_rle_bitpacked: 8-bit controls + depth-bit values, one
+    continuous MSB-first bitstream. Depth 8 falls back to byte RLE."""
+    if depth == 8:
+        return pack_rle_8bit(bytes(indices))
+    bw = _BitWriter()
+    i, n = 0, len(indices)
+    while i < n:
+        run = 1
+        while i + run < n and indices[i + run] == indices[i] and run < 128:
+            run += 1
+        if run >= 2:
+            bw.write((257 - run) & 0xFF, 8)
+            bw.write(indices[i], depth)
+            i += run
+        else:
+            start, cnt = i, 0
+            while i < n and cnt < 128:
+                if i + 1 < n and indices[i] == indices[i + 1]:
+                    break
+                i += 1
+                cnt += 1
+            bw.write(cnt - 1, 8)
+            for k in range(start, start + cnt):
+                bw.write(indices[k], depth)
+    return bw.getvalue()
+
+
+def median_cut_palette(weighted: List[Tuple[int, int, int, int]], max_colors: int):
+    """Weighted median-cut quantisation. weighted = [(r,g,b,count), ...]."""
+    if not weighted:
+        return [(0, 0, 0)]
+    boxes = [list(weighted)]
+
+    def extent(bx):
+        r = [c[0] for c in bx]
+        g = [c[1] for c in bx]
+        b = [c[2] for c in bx]
+        return max(max(r) - min(r), max(g) - min(g), max(b) - min(b))
+
+    while len(boxes) < max_colors:
+        cand = [(i, bx) for i, bx in enumerate(boxes) if len(bx) > 1]
+        if not cand:
+            break
+        i, bx = max(cand, key=lambda t: extent(t[1]))
+        r = [c[0] for c in bx]
+        g = [c[1] for c in bx]
+        b = [c[2] for c in bx]
+        rr, gg, bb = max(r) - min(r), max(g) - min(g), max(b) - min(b)
+        ch = 0 if rr >= gg and rr >= bb else (1 if gg >= bb else 2)
+        bx.sort(key=lambda c: c[ch])
+        total = sum(c[3] for c in bx)
+        acc, m = 0, 1
+        for k, c in enumerate(bx):
+            acc += c[3]
+            if acc >= total // 2:
+                m = max(1, min(len(bx) - 1, k + 1))
+                break
+        boxes[i:i + 1] = [bx[:m], bx[m:]]
+
+    pal = []
+    for bx in boxes:
+        w = sum(c[3] for c in bx)
+        pal.append((sum(c[0] * c[3] for c in bx) // w,
+                    sum(c[1] * c[3] for c in bx) // w,
+                    sum(c[2] * c[3] for c in bx) // w))
+    return pal
+
+
+def quantize_rgba_to_palette(pixels, max_colors: int = 255):
+    """pixels: list of (r,g,b) for opaque, or None for transparent. Returns
+    (indices, palette, transparent_index, has_transparency). Index 0 is reserved
+    transparent; opaque colours map to 1..N."""
+    from collections import Counter
+    cnt = Counter(p for p in pixels if p is not None)
+    weighted = [(r, g, b, w) for (r, g, b), w in cnt.items()]
+    has_transp = any(p is None for p in pixels)
+    pal_colors = median_cut_palette(weighted, max_colors)
+
+    cache: Dict[Tuple[int, int, int], int] = {}
+
+    def nearest(c):
+        bi, bd = 0, 1 << 30
+        for i, p in enumerate(pal_colors):
+            d = (c[0] - p[0]) ** 2 + (c[1] - p[1]) ** 2 + (c[2] - p[2]) ** 2
+            if d < bd:
+                bd, bi = d, i
+        return bi
+
+    indices = []
+    for p in pixels:
+        if p is None:
+            indices.append(0)
+        else:
+            if p not in cache:
+                cache[p] = nearest(p) + 1
+            indices.append(cache[p])
+    return indices, [(0, 0, 0)] + pal_colors, 0, has_transp
+
+
+def build_imag_chunk(indices, palette, transp_index: int, has_transp: bool) -> bytes:
+    ncols = len(palette)
+    depth = max(1, (ncols - 1).bit_length())
+    img = pack_rle_bitpacked(indices, depth)
+    palbytes = b"".join(bytes(c) for c in palette)
+    palc = pack_rle_8bit(palbytes)
+    flags = (0x01 if has_transp else 0) | 0x02     # bit0 transparency, bit1 has palette
+    hdr = bytes([transp_index, ncols - 1, flags, 1, 1, depth])
+    hdr += struct.pack(">H", len(img) - 1) + struct.pack(">H", len(palc) - 1)
+    return hdr + img + palc
+
+
+def build_form_icon(width: int, height: int, indices, palette,
+                    transp_index: int, has_transp: bool) -> bytes:
+    """Build a FORM ICON chunk (FACE + one IMAG) for a single image."""
+    imag = build_imag_chunk(indices, palette, transp_index, has_transp)
+    face = bytes([width - 1, height - 1, 0, 0]) + struct.pack(">H", len(palette) * 3 - 1)
+
+    def chunk(cid, data):
+        c = cid + struct.pack(">I", len(data)) + data
+        return c + (b"\0" if len(data) & 1 else b"")
+
+    body = b"ICON" + chunk(b"FACE", face) + chunk(b"IMAG", imag)
+    return b"FORM" + struct.pack(">I", len(body)) + body
+
+
+def build_coloricon_from_png(png_path: str, max_colors: int = 255):
+    """Read a PNG (any format), quantise, return (width, height, FORM ICON bytes)."""
+    reader = png.Reader(filename=png_path)
+    width, height, rows, _info = reader.asRGBA8()
+    pixels = []
+    for row in rows:
+        for x in range(width):
+            o = x * 4
+            a = row[o + 3]
+            pixels.append((row[o], row[o + 1], row[o + 2]) if a >= 128 else None)
+    idx, pal, transp, has_t = quantize_rgba_to_palette(pixels, max_colors)
+    return width, height, build_form_icon(width, height, idx, pal, transp, has_t)
+
+
+def import_coloricon_to_icon(icon: ParsedIcon, png_path: str) -> bool:
+    """Attach an OS3.5 ColorIcon built from a PNG (kept alongside the planar image
+    for older systems; rebuild_file writes it as the trailing FORM ICON)."""
+    if not HAS_PNG:
+        print("ColorIcon import requires pypng library. Install with: pip install pypng", file=sys.stderr)
+        return False
+    try:
+        _w, _h, form = build_coloricon_from_png(png_path)
+    except Exception as e:
+        print(f"Error building ColorIcon: {e}", file=sys.stderr)
+        return False
+    icon.glowicons = form
+    return True
+
+
 def parse_icon_file(path: str, strict: bool) -> ParsedIcon:
     data = bytearray(open(path, "rb").read())
     if not is_diskobject(data):
@@ -847,6 +1057,22 @@ def set_drawer_winsize(icon: ParsedIcon, w: int, h: int) -> bool:
     put_be_u16(dd, DD_NEWWIN_WIDTH_OFF, w)
     put_be_u16(dd, DD_NEWWIN_HEIGHT_OFF, h)
     icon.drawerdata = bytes(dd)
+    return True
+
+def set_defaulttool(icon: ParsedIcon, tool: str) -> None:
+    """Set (or replace) the DefaultTool string, creating the segment if absent."""
+    sb = tool.encode("latin-1", errors="strict") + b"\0"
+    icon.defaulttool = struct.pack(">I", len(sb)) + sb
+    icon.has_defaulttool = True
+    put_be_i32(icon.data, OFF_DEFAULTTOOL_PRESENCE, 1)
+
+def clear_defaulttool(icon: ParsedIcon) -> bool:
+    """Remove the DefaultTool segment. Returns True if one was present."""
+    if not icon.has_defaulttool:
+        return False
+    icon.has_defaulttool = False
+    icon.defaulttool = None
+    put_be_i32(icon.data, OFF_DEFAULTTOOL_PRESENCE, 0)
     return True
 
 def apply_tooltypes_ops(
@@ -1660,11 +1886,18 @@ def main() -> int:
     ap.add_argument("--edit", metavar="FIELD=VAL", action="append",
                     help="Edit structure field (e.g. DiskObject:Gadget:LeftEdge=100). Can be repeated.")
 
+    # DefaultTool (the program Workbench runs on double-click for project/tool icons)
+    ap.add_argument("--set-defaulttool", metavar="TOOL", help="Set/replace the DefaultTool string (creates it if absent)")
+    ap.add_argument("--clear-defaulttool", action="store_true", help="Remove the DefaultTool segment")
+
     # PNG import/export
     ap.add_argument("--export-icon", metavar="PATH", help="Export main icon to PNG file")
     ap.add_argument("--export-select-icon", metavar="PATH", help="Export select icon to PNG file")
     ap.add_argument("--import-icon", metavar="PATH", help="Import PNG file as main icon")
     ap.add_argument("--import-select-icon", metavar="PATH", help="Import PNG file as select icon")
+    ap.add_argument("--import-coloricon", metavar="PATH",
+                    help="Attach an OS3.5 ColorIcon (FORM ICON) built from a PNG — full colour + "
+                         "transparency (use with --import-icon for the planar fallback)")
     ap.add_argument("--transparency", choices=["edge", "all", "none"], default="edge",
                     help="Transparency mode for PNG export: 'edge' (default) = only edge-connected color 0, "
                          "'all' = all color 0 pixels, 'none' = no transparency")
@@ -1682,7 +1915,8 @@ def main() -> int:
     has_operation = (args.list or args.get or args.set or args.set_flag or args.unset or
                      args.delete or args.normalize or args.pos or args.winsize or args.compact or
                      args.edit or args.export_icon or args.export_select_icon or
-                     args.import_icon or args.import_select_icon)
+                     args.import_icon or args.import_select_icon or args.import_coloricon or
+                     args.set_defaulttool is not None or args.clear_defaulttool)
     if not has_operation:
         ap.error("No operation specified")
 
@@ -1784,6 +2018,20 @@ def main() -> int:
                 else:
                     rc = 1
 
+        # DefaultTool
+        if args.clear_defaulttool:
+            if clear_defaulttool(icon):
+                changed = True
+            else:
+                print(f"{info_path}: NOTE: --clear-defaulttool ignored (no DefaultTool present)")
+        if args.set_defaulttool is not None:
+            try:
+                set_defaulttool(icon, args.set_defaulttool)
+                changed = True
+            except UnicodeEncodeError:
+                print(f"{info_path}: ERROR: DefaultTool must be Latin-1 encodable", file=sys.stderr)
+                rc = 1
+
         # PNG export (read-only, no change to file)
         if args.export_icon:
             if export_icon_to_png(icon, 0, args.export_icon, args.transparency, args.planar):
@@ -1808,6 +2056,13 @@ def main() -> int:
         if args.import_select_icon:
             if import_png_to_icon(icon, 1, args.import_select_icon):
                 print(f"{info_path}: imported select icon from {args.import_select_icon}")
+                changed = True
+            else:
+                rc = 1
+
+        if args.import_coloricon:
+            if import_coloricon_to_icon(icon, args.import_coloricon):
+                print(f"{info_path}: attached ColorIcon from {args.import_coloricon}")
                 changed = True
             else:
                 rc = 1
