@@ -938,8 +938,56 @@ def import_coloricon_to_icon(icon: ParsedIcon, png_path: str) -> bool:
     return True
 
 
+# Workbench icon type codes (DiskObject.do_Type), for --create
+TYPE_CODE = {
+    "DISK": 1, "DRAWER": 2, "TOOL": 3, "PROJECT": 4,
+    "GARBAGE": 5, "DEVICE": 6, "KICK": 7, "APPICON": 8,
+}
+
+def build_template_diskobject(itype: str = "TOOL", stack: int = 4096) -> bytearray:
+    """A minimal, self-authored classic DiskObject to import onto — no
+    third-party icon bytes. Header layout per icon.library; the 8x8 depth-1
+    placeholder Image is replaced by --import-icon."""
+    code = TYPE_CODE.get(str(itype).upper(), 3) if not str(itype).isdigit() else int(itype)
+    b = bytearray()
+    b += struct.pack(">H", 0xE310)       # Magic (WB_DISKMAGIC)
+    b += struct.pack(">H", 1)            # Version
+    b += struct.pack(">I", 0)            # Gadget.NextGadget
+    b += struct.pack(">HH", 0, 0)        # Left,Top
+    b += struct.pack(">HH", 8, 8)        # Width,Height (bumped on import)
+    b += struct.pack(">H", 0x0005)       # Flags  GADGHBOX|GADGIMAGE
+    b += struct.pack(">H", 0x0003)       # Activation RELVERIFY|GADGIMMEDIATE
+    b += struct.pack(">H", 1)            # GadgetType
+    b += struct.pack(">I", 0x000000FF)   # GadgetRender (fixed up by icon.library)
+    b += struct.pack(">I", 0)            # SelectRender = 0 -> single image
+    b += struct.pack(">I", 0)            # GadgetText
+    b += struct.pack(">I", 0)            # MutualExclude
+    b += struct.pack(">I", 0)            # SpecialInfo
+    b += struct.pack(">H", 0)            # GadgetID
+    b += struct.pack(">I", 1)            # UserData (low byte = revision 1)
+    b += struct.pack(">B", code)         # Type
+    b += struct.pack(">B", 0)            # Padding
+    b += struct.pack(">I", 0)            # DefaultTool presence (none yet)
+    b += struct.pack(">I", 0)            # ToolTypes presence
+    b += struct.pack(">i", -2147483648)  # CurrentX = NO_ICON_POSITION
+    b += struct.pack(">i", -2147483648)  # CurrentY
+    b += struct.pack(">I", 0)            # DrawerData
+    b += struct.pack(">I", 0)            # ToolWindow
+    b += struct.pack(">I", int(stack))   # StackSize
+    assert len(b) == DISKOBJECT_LEN, len(b)
+    b += struct.pack(">HH", 0, 0)        # Image Left,Top
+    b += struct.pack(">HH", 8, 8)        # Width,Height
+    b += struct.pack(">H", 1)            # Depth
+    b += struct.pack(">I", 0x12345678)   # ImageData placeholder
+    b += struct.pack(">bb", 1, 0)        # PlanePick,PlaneOnOff
+    b += struct.pack(">I", 0)            # NextImage
+    b += bytes(((8 + 15) // 16) * 2 * 8 * 1)   # planar bitmap (16 zero bytes)
+    return b
+
 def parse_icon_file(path: str, strict: bool) -> ParsedIcon:
-    data = bytearray(open(path, "rb").read())
+    return parse_icon_bytes(bytearray(open(path, "rb").read()), strict)
+
+def parse_icon_bytes(data: bytearray, strict: bool) -> ParsedIcon:
     if not is_diskobject(data):
         raise ValueError("Not an Amiga icon (.info) (WB_DISKMAGIC mismatch)")
     if strict and len(data) < DISKOBJECT_LEN:
@@ -1077,10 +1125,7 @@ def clear_defaulttool(icon: ParsedIcon) -> bool:
 
 def apply_tooltypes_ops(
     entries_raw: List[bytes],
-    op_set_kv: Optional[Tuple[str, str]],
-    op_set_flag: Optional[str],
-    op_unset_flag: Optional[str],
-    op_del: Optional[str],
+    ops: Optional[List[Tuple[str, str]]],
     op_norm: bool,
     ignore_case: bool
 ) -> List[bytes]:
@@ -1090,29 +1135,28 @@ def apply_tooltypes_ops(
         item = parse_tt_item(line)
         return key_eq(item.key, want_key, ignore_case)
 
-    # delete (removes KEY, (KEY), and KEY=VAL)
-    if op_del:
-        want = canon_key(op_del)
+    # Every op is repeatable, and they are applied in the order given on the
+    # command line so one invocation can write a whole tooltype set with a
+    # predictable resulting order. Each op first removes every prior form of
+    # its key (KEY, (KEY), KEY=VAL), then appends the new one.
+    for op, value in (ops or []):
+        if op == "delete":
+            entries = [s for s in entries if not matches_key(s, canon_key(value))]
+            continue
+        if op == "set":
+            k, v = value.split("=", 1)
+            want = canon_key(k)
+            new = f"{want}={v}"
+        elif op == "set_flag":
+            want = canon_key(value)
+            new = f"{want}"
+        elif op == "unset":
+            want = canon_key(value)
+            new = f"({want})"
+        else:
+            raise ValueError(f"unknown tooltype op {op}")
         entries = [s for s in entries if not matches_key(s, want)]
-
-    # set KV (removes all prior forms, then writes KEY=VAL)
-    if op_set_kv:
-        k, v = op_set_kv
-        want = canon_key(k)
-        entries = [s for s in entries if not matches_key(s, want)]
-        entries.append(f"{want}={v}")
-
-    # set flag true (removes all prior forms, then writes KEY)
-    if op_set_flag:
-        want = canon_key(op_set_flag)
-        entries = [s for s in entries if not matches_key(s, want)]
-        entries.append(f"{want}")
-
-    # unset flag (removes all prior forms, then writes (KEY))
-    if op_unset_flag:
-        want = canon_key(op_unset_flag)
-        entries = [s for s in entries if not matches_key(s, want)]
-        entries.append(f"({want})")
+        entries.append(new)
 
     if op_norm:
         # last-wins across all forms (kv, KEY, (KEY))
@@ -1859,11 +1903,31 @@ def import_png_to_icon(icon: ParsedIcon, icon_index: int, png_path: str) -> bool
     return True
 
 
+class ToolTypeOp(argparse.Action):
+    """Record --set/--set-flag/--unset/--delete into one list in command-line
+    order, so a single invocation can build a tooltype set whose resulting
+    order is predictable. Also keeps the usual per-option list, so plain
+    "did the user ask for this?" checks still work."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        ops = getattr(namespace, "tt_ops", None)
+        if ops is None:
+            ops = []
+            setattr(namespace, "tt_ops", ops)
+        ops.append((self.dest, values))
+        seen = getattr(namespace, self.dest, None) or []
+        seen.append(values)
+        setattr(namespace, self.dest, seen)
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Batch edit Amiga Workbench .info files: ToolTypes, icon position, structure fields, PNG import/export"
     )
     ap.add_argument("paths", nargs="+", help="Paths to .info files (or base names without .info)")
+    ap.add_argument("--create", metavar="TYPE", nargs="?", const="TOOL",
+                    help="Create a new icon from scratch instead of reading the path "
+                         "(TYPE: " + "|".join(TYPE_CODE) + ", default TOOL). Set the stack "
+                         "with --edit DiskObject:StackSize=N.")
 
     # Listing / inspection
     ap.add_argument("--list", action="store_true", help="List parsed metadata + tooltypes")
@@ -1871,10 +1935,14 @@ def main() -> int:
 
     # ToolTypes operations
     ap.add_argument("--get", metavar="KEY", help="Get ToolType KEY. For booleans, prints KEY=true/false. Accepts KEY or (KEY).")
-    ap.add_argument("--set", metavar="KEY=VAL", help="Set/replace ToolType KEY=VAL")
-    ap.add_argument("--set-flag", metavar="KEY", help="Set boolean ToolType KEY (writes KEY)")
-    ap.add_argument("--unset", metavar="KEY", help="Unset/disable boolean ToolType KEY (writes (KEY))")
-    ap.add_argument("--delete", metavar="KEY", help="Delete ToolType KEY (removes KEY, (KEY), and KEY=VAL)")
+    ap.add_argument("--set", metavar="KEY=VAL", action=ToolTypeOp,
+                    help="Set/replace ToolType KEY=VAL. Can be repeated.")
+    ap.add_argument("--set-flag", metavar="KEY", action=ToolTypeOp,
+                    help="Set boolean ToolType KEY (writes KEY). Can be repeated.")
+    ap.add_argument("--unset", metavar="KEY", action=ToolTypeOp,
+                    help="Unset/disable boolean ToolType KEY (writes (KEY)). Can be repeated.")
+    ap.add_argument("--delete", metavar="KEY", action=ToolTypeOp,
+                    help="Delete ToolType KEY (removes KEY, (KEY), and KEY=VAL). Can be repeated.")
     ap.add_argument("--normalize", action="store_true", help="Normalize tooltypes (last-wins per key, remove empties)")
     ap.add_argument("--ignore-case", action="store_true", help="Match keys case-insensitively")
 
@@ -1916,19 +1984,22 @@ def main() -> int:
                      args.delete or args.normalize or args.pos or args.winsize or args.compact or
                      args.edit or args.export_icon or args.export_select_icon or
                      args.import_icon or args.import_select_icon or args.import_coloricon or
-                     args.set_defaulttool is not None or args.clear_defaulttool)
+                     args.set_defaulttool is not None or args.clear_defaulttool or
+                     args.create is not None)
     if not has_operation:
         ap.error("No operation specified")
 
     if args.output and len(args.paths) > 1:
         ap.error("--output can only be used with a single input file")
 
-    op_set_kv = None
-    if args.set:
-        if "=" not in args.set:
+    if args.create is not None and not str(args.create).isdigit() \
+            and str(args.create).upper() not in TYPE_CODE:
+        ap.error("--create TYPE must be one of " + ", ".join(TYPE_CODE))
+
+    tt_ops = getattr(args, "tt_ops", None) or []
+    for op, value in tt_ops:
+        if op == "set" and "=" not in value:
             ap.error("--set requires KEY=VAL")
-        k, v = args.set.split("=", 1)
-        op_set_kv = (k, v)
 
     pos_xy = None
     if args.pos:
@@ -1949,7 +2020,11 @@ def main() -> int:
     for p in args.paths:
         info_path = p if p.lower().endswith(".info") else p + ".info"
         try:
-            icon = parse_icon_file(info_path, strict=args.strict)
+            if args.create is not None:
+                icon = parse_icon_bytes(build_template_diskobject(args.create),
+                                        strict=args.strict)
+            else:
+                icon = parse_icon_file(info_path, strict=args.strict)
         except Exception as e:
             print(f"{info_path}: ERROR: {e}", file=sys.stderr)
             rc = 2
@@ -2070,14 +2145,11 @@ def main() -> int:
         new_tooltypes = None
         # Tool icons (type 3) can have tooltypes added even if they don't exist yet
         can_have_tooltypes = icon.has_tooltypes or icon.icon_type == 3
-        if can_have_tooltypes and (op_set_kv or args.set_flag or args.unset or args.delete or args.normalize):
+        if can_have_tooltypes and (tt_ops or args.normalize):
             existing_entries = icon.tooltypes_raw_entries if icon.has_tooltypes else []
             new_tooltypes = apply_tooltypes_ops(
                 existing_entries,
-                op_set_kv=op_set_kv,
-                op_set_flag=args.set_flag,
-                op_unset_flag=args.unset,
-                op_del=args.delete,
+                ops=tt_ops,
                 op_norm=args.normalize,
                 ignore_case=args.ignore_case,
             )
@@ -2098,8 +2170,9 @@ def main() -> int:
             # Determine output path
             out_path = args.output if args.output else info_path
 
-            # Skip if no actual changes (only for in-place updates)
-            if not args.output:
+            # Skip if no actual changes (only for in-place updates of an
+            # existing file — with --create there is nothing to compare to)
+            if not args.output and args.create is None:
                 old_bytes = open(info_path, "rb").read()
                 if new_bytes == old_bytes:
                     continue
@@ -2111,8 +2184,8 @@ def main() -> int:
                     print(f"{info_path}: would update")
                 continue
 
-            # Backup only for in-place updates
-            if args.backup and not args.output:
+            # Backup only for in-place updates of an existing file
+            if args.backup and not args.output and args.create is None:
                 bak = info_path + ".bak"
                 if not os.path.exists(bak):
                     shutil.copy2(info_path, bak)
