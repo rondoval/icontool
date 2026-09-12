@@ -2143,8 +2143,13 @@ def main() -> int:
                 rc = 1
 
         new_tooltypes = None
-        # Tool icons (type 3) can have tooltypes added even if they don't exist yet
-        can_have_tooltypes = icon.has_tooltypes or icon.icon_type == 3
+        # Tool (3) and project (4) icons can have tooltypes added even if they
+        # don't exist yet (a project's tooltypes go to its DefaultTool, e.g.
+        # APPNAME for the Installer)
+        can_have_tooltypes = icon.has_tooltypes or icon.icon_type in (3, 4)
+        if tt_ops and not can_have_tooltypes:
+            print(f"{info_path}: NOTE: tooltype options ignored "
+                  f"({icon_type_name(icon.icon_type)} icon has no ToolTypes)")
         if can_have_tooltypes and (tt_ops or args.normalize):
             existing_entries = icon.tooltypes_raw_entries if icon.has_tooltypes else []
             new_tooltypes = apply_tooltypes_ops(
